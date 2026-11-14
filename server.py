@@ -1,182 +1,114 @@
+import hmac
 import json
 import os
+import threading
+import time
 from pathlib import Path
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
-from threading import BoundedSemaphore
+from flask import Flask, request, jsonify, Response, send_file
 
+app = Flask(__name__, static_folder=None)
+app.config['MAX_CONTENT_LENGTH'] = 100_000
 ROOT = Path(__file__).resolve().parent
-# Read only known local settings; never evaluate shell commands.
-env_file = ROOT / '.env'
-if env_file.exists():
-    for line in env_file.read_text(encoding='utf-8').splitlines():
-        line = line.strip()
-        if not line or line.startswith('#') or '=' not in line:
-            continue
-        key, value = line.split('=', 1)
-        if key.strip() in {'RELAY_API_KEY', 'PORT', 'RELAY_MAX_TOKENS'}:
-            os.environ.setdefault(key.strip(), value.strip().strip('"\''))
+API_KEY = os.environ.get('OPENROUTER_API_KEY', '').strip()
+PASSWORD = os.environ.get('APP_PASSWORD', '')
+ORIGIN = (os.environ.get('APP_ORIGIN') or os.environ.get('RENDER_EXTERNAL_URL') or '').rstrip('/')
+if not ORIGIN and os.environ.get('RENDER_EXTERNAL_HOSTNAME'):
+    ORIGIN = 'https://' + os.environ['RENDER_EXTERNAL_HOSTNAME']
+if not API_KEY or len(PASSWORD) < 16 or not ORIGIN.startswith('https://'):
+    raise RuntimeError('Set OPENROUTER_API_KEY, APP_PASSWORD (16+ characters), and APP_ORIGIN (your HTTPS website URL).')
+lock = threading.Lock()
+slots = threading.BoundedSemaphore(1)
+state = {'last': 0.0, 'day': -1, 'count': 0, 'auth_times': []}
 
-KEY = os.environ.get('RELAY_API_KEY', '').strip()
-PORT = int(os.environ.get('PORT', '8000'))
-MAX_TOKENS = max(1, min(int(os.environ.get('RELAY_MAX_TOKENS', '1024')), 8192))
-BASE = 'https://codex-relay.codes/v1'
-SLOTS = BoundedSemaphore(1)
-ALLOWED_HOSTS = {f'localhost:{PORT}', f'127.0.0.1:{PORT}'}
-ALLOWED_ORIGINS = {f'http://{host}' for host in ALLOWED_HOSTS}
+@app.before_request
+def protect():
+    if request.path == '/healthz' and request.method == 'GET':
+        return None
+    auth = request.authorization
+    valid = auth and auth.type.lower() == 'basic' and hmac.compare_digest((auth.username or '').encode(), b'haxy') and hmac.compare_digest((auth.password or '').encode(), PASSWORD.encode())
+    if not valid:
+        now = time.monotonic()
+        with lock:
+            state['auth_times'] = [t for t in state['auth_times'] if now-t < 60]
+            if len(state['auth_times']) >= 30:
+                return jsonify(error='Too many login attempts. Wait a minute.'), 429
+            state['auth_times'].append(now)
+        return Response('Sign in with username haxy and your app password.', 401, {'WWW-Authenticate': 'Basic realm="HAXY", charset="UTF-8"'})
+    if request.method not in ('GET', 'HEAD', 'POST'):
+        return jsonify(error='Method not allowed.'), 405
+    if request.method == 'POST' and (request.headers.get('Origin', '').rstrip('/') != ORIGIN or request.headers.get('Sec-Fetch-Site') == 'cross-site'):
+        return jsonify(error='Origin rejected. Check APP_ORIGIN matches this website URL exactly.'), 403
 
+@app.after_request
+def headers(response):
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000'
+    return response
 
-def upstream(path, data=None):
-    if not KEY or KEY == 'paste_your_new_key_here':
-        raise ValueError('Set RELAY_API_KEY in your local .env file, then restart the server.')
-    req = Request(BASE + path,
-                  data=json.dumps(data).encode() if data is not None else None,
-                  headers={'Authorization': 'Bearer ' + KEY,
-                           'Content-Type': 'application/json',
-                           'Accept': 'application/json',
-                           'User-Agent': 'HaxyLocal/1.0'})
-    with urlopen(req, timeout=90) as response:
-        raw = response.read(4_000_001)
-        if len(raw) > 4_000_000:
-            raise ValueError('Provider response exceeded the local size limit.')
-        return json.loads(raw)
+@app.get('/healthz')
+def health():
+    return jsonify(status='ok')
 
+@app.get('/')
+@app.get('/index.html')
+def index():
+    return send_file(ROOT / 'index.html')
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = 'HaxyLocal'
+@app.get('/api/status')
+def status():
+    return jsonify(configured=True)
 
-    def log_message(self, fmt, *args):
-        # Do not log request paths, message bodies, keys, or provider responses.
-        pass
-
-    def reply(self, code, data):
-        raw = json.dumps(data).encode()
-        self.send_response(code)
-        self.send_header('Content-Type', 'application/json; charset=utf-8')
-        self.send_header('Content-Length', str(len(raw)))
-        self.send_header('Cache-Control', 'no-store')
-        self.send_header('X-Content-Type-Options', 'nosniff')
-        self.end_headers()
-        self.wfile.write(raw)
-
-    def trusted(self, write=False):
-        if self.headers.get('Host') not in ALLOWED_HOSTS:
-            self.reply(403, {'error': 'Unrecognized local host.'})
-            return False
-        origin = self.headers.get('Origin')
-        if (origin and origin not in ALLOWED_ORIGINS) or (write and origin not in ALLOWED_ORIGINS):
-            self.reply(403, {'error': 'Only the local HAXY page can make this request.'})
-            return False
-        if self.headers.get('Sec-Fetch-Site') == 'cross-site':
-            self.reply(403, {'error': 'Cross-site requests are disabled.'})
-            return False
-        return True
-
-    def fail(self, error):
-        if isinstance(error, HTTPError):
-            code = error.code
-            text = {400: 'Relay rejected this request. Check model compatibility and conversation size.',
-                    401: 'Relay rejected the API key. Replace it locally and restart.',
-                    402: 'Relay reports insufficient credits or a billing restriction.',
-                    403: 'Relay denied access. Check your key permissions and account.',
-                    404: 'Relay could not find this endpoint or model. Refresh the model list.',
-                    429: 'Relay rate limit or quota reached. Wait before retrying.'}.get(code, 'Relay returned an error. Check its dashboard for details.')
-            self.reply(code if 400 <= code < 500 else 502, {'error': text})
-        elif isinstance(error, ValueError):
-            self.reply(400, {'error': str(error) if not isinstance(error, json.JSONDecodeError) else 'Invalid JSON response.'})
-        else:
-            self.reply(502, {'error': 'Cannot reach Relay or the request timed out. Check the dashboard before retrying; a timed-out request may still be billed.'})
-
-    def do_GET(self):
-        if not self.trusted():
-            return
-        if self.path in ('/', '/index.html'):
-            raw = (ROOT / 'public' / 'index.html').read_bytes()
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.send_header('Content-Length', str(len(raw)))
-            self.send_header('Cache-Control', 'no-store')
-            self.send_header('X-Content-Type-Options', 'nosniff')
-            self.send_header('X-Frame-Options', 'DENY')
-            self.send_header('Referrer-Policy', 'no-referrer')
-            self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
-            self.end_headers()
-            self.wfile.write(raw)
-        elif self.path == '/api/models':
-            try:
-                data = upstream('/models')
-                models = sorted({m['id'] for m in data.get('data', [])
-                                 if isinstance(m, dict) and isinstance(m.get('id'), str)})
-                self.reply(200, {'models': models})
-            except Exception as error:
-                self.fail(error)
-        else:
-            self.reply(404, {'error': 'Not found.'})
-
-    def do_POST(self):
-        if not self.trusted(write=True):
-            return
-        if self.path != '/api/chat':
-            self.reply(404, {'error': 'Not found.'})
-            return
-        if self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
-            self.reply(415, {'error': 'Expected application/json.'})
-            return
-        try:
-            size = int(self.headers.get('Content-Length', '0'))
-            if not 0 < size <= 250_000:
-                self.reply(413, {'error': 'Conversation too large. Reload to start a new chat.'})
-                return
-            body = json.loads(self.rfile.read(size))
-            if not isinstance(body, dict):
-                raise ValueError('Invalid request.')
-            model, messages = body.get('model'), body.get('messages')
-            if not isinstance(model, str) or not model or len(model) > 250:
-                raise ValueError('Select a valid model.')
-            if not isinstance(messages, list) or not 1 <= len(messages) <= 100:
-                raise ValueError('Conversation must contain 1–100 messages. Reload to start over.')
-            clean = []
-            for message in messages:
-                if not isinstance(message, dict) or message.get('role') not in ('user', 'assistant'):
-                    raise ValueError('Invalid message role.')
-                text = message.get('content')
-                if not isinstance(text, str) or not text.strip() or len(text) > 30000:
-                    raise ValueError('Each message must contain 1–30,000 characters.')
-                clean.append({'role': message['role'], 'content': text})
-        except (ValueError, TypeError) as error:
-            self.fail(error)
-            return
-        if not SLOTS.acquire(blocking=False):
-            self.reply(429, {'error': 'A chat request is already running. Please wait.'})
-            return
-        try:
-            data = upstream('/chat/completions', {
-                'model': model, 'messages': clean, 'stream': False, 'max_tokens': MAX_TOKENS
-            })
-            choices = data.get('choices', [])
-            msg = choices[0].get('message', {}) if choices else {}
-            content = msg.get('content')
-            if isinstance(content, list):
-                content = '\n'.join(part.get('text', '') for part in content if isinstance(part, dict))
-            if not isinstance(content, str) or not content.strip():
-                raise ValueError('Relay returned no text response. This model may not support plain text chat or may need a different token limit.')
-            self.reply(200, {'content': content})
-        except Exception as error:
-            self.fail(error)
-        finally:
-            SLOTS.release()
-
-
-if __name__ == '__main__':
-    if not KEY:
-        print('No key configured. Copy .env.example to .env and add your replacement key.')
-    print(f'HAXY is running at http://localhost:{PORT}. Press Ctrl+C to stop.')
-    server = ThreadingHTTPServer(('127.0.0.1', PORT), Handler)
-    server.daemon_threads = True
+@app.post('/api/chat')
+def chat():
+    if not request.is_json:
+        return jsonify(error='Expected JSON.'), 415
+    data = request.get_json(silent=True)
+    messages = data.get('messages') if isinstance(data, dict) else None
+    if not isinstance(messages, list) or not 1 <= len(messages) <= 20:
+        return jsonify(error='Send 1â€“20 chat messages.'), 400
+    clean = []
+    for m in messages:
+        if not isinstance(m, dict) or m.get('role') not in ('user', 'assistant') or not isinstance(m.get('content'), str) or not 1 <= len(m['content']) <= 12000:
+            return jsonify(error='Invalid message or message too long.'), 400
+        clean.append({'role': m['role'], 'content': m['content']})
+    if sum(len(m['content']) for m in clean) > 60000:
+        return jsonify(error='Conversation too long. Reload to start a new chat.'), 400
+    if not slots.acquire(blocking=False):
+        return jsonify(error='A reply is already in progress. Try again shortly.'), 429
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print('\nStopped.')
+        now = time.monotonic()
+        day = int(time.time() // 86400)
+        with lock:
+            if state['day'] != day:
+                state.update(day=day, count=0)
+            if now-state['last'] < 5 or state['count'] >= 40:
+                return jsonify(error='App limit reached. Allow 5 seconds between requests; maximum 40 per UTC day while this process runs.'), 429
+            state['last'] = now
+            state['count'] += 1
+        payload = {'model': 'openrouter/free', 'messages': [{'role': 'system', 'content': 'You are HAXY, a helpful, accurate creative assistant.'}] + clean, 'max_tokens': 1024, 'stream': False}
+        upstream = Request('https://openrouter.ai/api/v1/chat/completions', data=json.dumps(payload).encode(), headers={'Authorization': 'Bearer '+API_KEY, 'Content-Type': 'application/json'})
+        try:
+            with urlopen(upstream, timeout=85) as reply:
+                result = json.load(reply)
+            content = result.get('choices', [{}])[0].get('message', {}).get('content')
+            if not isinstance(content, str) or not content.strip():
+                return jsonify(error='No text returned by provider. Try again.'), 502
+            return jsonify(content=content, model=result.get('model', 'openrouter/free'))
+        except HTTPError as exc:
+            text = {401: 'OpenRouter key is invalid. Update it in Render.', 402: 'OpenRouter rejected this request for account or credit reasons. Paid fallback is disabled.', 403: 'Provider denied access. Check OpenRouter permissions and data settings.', 429: 'OpenRouter free quota reached. Try later.'}.get(exc.code, 'Provider unavailable. Try later.')
+            return jsonify(error=text), exc.code if exc.code in (401,402,403,429) else 502
+        except (URLError, TimeoutError, OSError):
+            return jsonify(error='Provider network error or timeout. Try again.'), 502
+        except (ValueError, TypeError, IndexError, AttributeError):
+            return jsonify(error='Unexpected provider response.'), 502
     finally:
-        server.server_close()
+        slots.release()
+
+@app.errorhandler(413)
+def too_big(error):
+    return jsonify(error='Request too large.'), 413
