@@ -119,7 +119,7 @@ def chat():
                 return jsonify(error='App limit reached. Allow 5 seconds between requests; maximum 40 per UTC day while this process runs.'), 429
             state['last'] = now
             state['count'] += 1
-        payload = {'model': 'cognitivecomputations/dolphin-mistral-24b-venice-edition', 'messages': [{'role': 'system', 'content': SYSTEM_PROMPT}] + clean, 'max_tokens': 1024, 'stream': False}
+        payload = {'model': 'deepseek/deepseek-v4.1-flash-1017:free', 'messages': [{'role': 'system', 'content': SYSTEM_PROMPT}] + clean, 'max_tokens': 1024, 'stream': False}
         upstream = Request('https://openrouter.ai/api/v1/chat/completions', data=json.dumps(payload).encode(), headers={'Authorization': 'Bearer '+API_KEY, 'Content-Type': 'application/json'})
         try:
             with urlopen(upstream, timeout=85) as reply:
